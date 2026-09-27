@@ -3,6 +3,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { quoteOrder, estimateMaterials, wasteRate, isOverWasteLimit, masterHoldingOrder } from "./src/orderCalc.js";
+import { defaultInventory, materialShortage, postProductionCosts, postPayment, orderAccount, restock } from "./src/ledger.js";
+import { orderPage } from "./src/orderPage.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "cyanotype-negative-room.json");
@@ -26,8 +29,20 @@ const seed = {
         }
       ]
     }
-  ]
+  ],
+  "inventory": defaultInventory(),
+  "orders": [],
+  "ledger": []
 };
+function normalize(db) {
+  db.items ||= [];
+  db.inventory ||= defaultInventory();
+  db.inventory.chemicals ||= [];
+  db.inventory.paper ||= [];
+  db.orders ||= [];
+  db.ledger ||= [];
+  return db;
+}
 const fields = [["code","底片编号","text"],["plateSize","玻璃板尺寸","text"],["chemicalBatch","药液批次","text"],["exposure","曝光时间","text"],["waterSource","冲洗水源","text"],["box","存放盒位","text"]];
 const stages = ["待曝光","冲洗中","待入盒","已交付"];
 const statLabels = ["待曝光","冲洗中","待入盒","已交付"];
@@ -38,7 +53,7 @@ async function loadDb() {
     await mkdir(dirname(dbPath), { recursive: true });
     await writeFile(dbPath, JSON.stringify(seed, null, 2));
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
+  return normalize(JSON.parse(await readFile(dbPath, "utf8")));
 }
 async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
@@ -90,7 +105,7 @@ function page() {
   </style>
 </head>
 <body>
-  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><div><a class="pill" href="/orders" style="margin-right:8px;text-decoration:none;color:inherit">复制订单结算台</a><button id="reload">刷新</button></div></header>
   <main>
     <section>
       <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存底片</button></form>
@@ -199,6 +214,152 @@ const server = http.createServer(async (req, res) => {
       item.logs.push({ at: new Date().toISOString(), step: input.step || "工艺", note: input.note || input.developStatus || "步骤记录" });
       await saveDb(db);
       return send(res, 201, item);
+    }
+    if (req.method === "GET" && url.pathname === "/orders") return html(res, orderPage());
+    if (req.method === "GET" && url.pathname === "/api/orders") {
+      const list = db.orders.map(o => ({
+        ...o,
+        account: orderAccount(db, o),
+        shortage: o.status === "待备料" ? materialShortage(db, o) : o.shortage || [],
+      }));
+      return send(res, 200, list);
+    }
+    if (req.method === "POST" && url.pathname === "/api/orders") {
+      const input = await body(req);
+      const master = db.items.find(x => x.id === input.masterCode || x.code === input.masterCode);
+      if (!master) return send(res, 404, { error: "master_not_found" });
+      const masterCode = master.code || master.id;
+      const holding = masterHoldingOrder(db.orders, masterCode);
+      if (holding) return send(res, 409, { error: `母版 ${masterCode} 已有未结束订单 ${holding.id}，同一母版同时只保留一张` });
+      const qty = Number(input.qty);
+      const rush = input.rush === true || input.rush === "true" || input.rush === "on";
+      let quote, estimate;
+      try {
+        quote = quoteOrder({ size: input.size, qty, rush });
+        estimate = estimateMaterials({ size: input.size, qty });
+      } catch (error) { return send(res, 400, { error: error.message }); }
+      const now = new Date().toISOString();
+      const order = {
+        id: "PO-" + Date.now(),
+        masterCode,
+        chemicalBatch: master.chemicalBatch || "",
+        size: input.size,
+        qty,
+        rush,
+        reworkRounds: 0,
+        quote,
+        estimate,
+        production: null,
+        status: "待备料",
+        shortage: [],
+        logs: [{ at: now, step: "开单", note: `复制 ${qty} 张 ${input.size}${rush ? "，加急" : ""}，报价 ${quote.total} 元` }],
+        createdAt: now,
+      };
+      const shortage = materialShortage(db, order);
+      if (shortage.length) {
+        order.shortage = shortage;
+        order.logs.push({ at: now, step: "待备料", note: shortage.join("；") + "，母版暂不占用" });
+      } else {
+        order.status = "待制作";
+        order.logs.push({ at: now, step: "排产", note: "备料充足，母版占用" });
+      }
+      db.orders.unshift(order);
+      await saveDb(db);
+      return send(res, 201, order);
+    }
+    const orderAct = url.pathname.match(/^\/api\/orders\/([^/]+)\/(recheck|production|review|payments|deliver|cancel)$/);
+    if (orderAct && req.method === "POST") {
+      const order = db.orders.find(o => o.id === orderAct[1]);
+      if (!order) return send(res, 404, { error: "order_not_found" });
+      const input = await body(req);
+      const now = new Date().toISOString();
+      const act = orderAct[2];
+      if (act === "recheck") {
+        if (order.status !== "待备料") return send(res, 409, { error: "只有待备料订单需要复检" });
+        const holding = masterHoldingOrder(db.orders, order.masterCode, order.id);
+        if (holding) return send(res, 409, { error: `母版 ${order.masterCode} 已被订单 ${holding.id} 占用` });
+        const shortage = materialShortage(db, order);
+        if (shortage.length) {
+          order.shortage = shortage;
+          order.logs.push({ at: now, step: "待备料", note: shortage.join("；") });
+          await saveDb(db);
+          return send(res, 409, { error: "仍缺料：" + shortage.join("；") });
+        }
+        order.shortage = [];
+        order.status = "待制作";
+        order.logs.push({ at: now, step: "排产", note: "备料齐，母版占用" });
+      }
+      if (act === "production") {
+        if (order.status !== "待制作") return send(res, 409, { error: "订单当前不在待制作状态" });
+        const actual = {
+          finished: Number(input.finished),
+          waste: Number(input.waste),
+          chemicalMl: Number(input.chemicalMl),
+          paperSheets: Number(input.paperSheets),
+        };
+        if (![actual.finished, actual.waste, actual.paperSheets].every(n => Number.isInteger(n) && n >= 0) || !(actual.chemicalMl >= 0)) {
+          return send(res, 400, { error: "成品、废片、纸张须为非负整数，药液须为非负数" });
+        }
+        if (actual.finished + actual.waste === 0) return send(res, 400, { error: "成品与废片不能同时为 0" });
+        try { postProductionCosts(db, order, actual); } catch (error) { return send(res, 409, { error: error.message }); }
+        const rate = wasteRate(actual.finished, actual.waste);
+        order.production = { ...actual, wasteRate: rate, at: now };
+        if (isOverWasteLimit(actual.finished, actual.waste)) {
+          order.status = "复核";
+          order.logs.push({ at: now, step: "复核", note: `废片率 ${(rate * 100).toFixed(1)}% 超过一成，退回复核` });
+        } else {
+          order.status = "待出库";
+          order.logs.push({ at: now, step: "生产完成", note: `成品 ${actual.finished} 张、废片 ${actual.waste} 张，成品留存待出库` });
+        }
+      }
+      if (act === "review") {
+        if (order.status !== "复核") return send(res, 409, { error: "订单当前不在复核状态" });
+        if (input.decision === "rework") {
+          order.reworkRounds = (order.reworkRounds || 0) + 1;
+          order.quote = quoteOrder({ size: order.size, qty: order.qty, rush: order.rush, reworkRounds: order.reworkRounds });
+          order.production = null;
+          order.status = "待制作";
+          order.logs.push({ at: now, step: "返工", note: `第 ${order.reworkRounds} 轮返工，返工费另计 ${order.quote.reworkFee} 元` });
+        } else if (input.decision === "accept") {
+          order.status = "待出库";
+          order.logs.push({ at: now, step: "复核通过", note: "成品留存待出库" });
+        } else {
+          return send(res, 400, { error: "decision 只能是 rework 或 accept" });
+        }
+      }
+      if (act === "payments") {
+        if (["已完成", "已取消"].includes(order.status)) return send(res, 409, { error: "订单已结束，不能再收款" });
+        try { postPayment(db, order, { kind: input.kind || "收款", amount: input.amount }); }
+        catch (error) { return send(res, 400, { error: error.message }); }
+        order.logs.push({ at: now, step: "收款", note: `${input.kind || "收款"} ${Number(input.amount).toFixed(2)} 元` });
+      }
+      if (act === "deliver") {
+        if (order.status !== "待出库") return send(res, 409, { error: "订单当前不在待出库状态" });
+        const account = orderAccount(db, order);
+        if (account.received < order.quote.total) {
+          return send(res, 409, { error: `尾款未结清（已收 ${account.received} / 应收 ${order.quote.total}），成品留存，账面保持待出库` });
+        }
+        order.status = "已完成";
+        order.logs.push({ at: now, step: "出库", note: "尾款结清，成品出库，母版释放" });
+      }
+      if (act === "cancel") {
+        if (["已完成", "已取消"].includes(order.status)) return send(res, 409, { error: "订单已结束" });
+        order.status = "已取消";
+        order.logs.push({ at: now, step: "取消", note: "订单取消，母版释放" });
+      }
+      await saveDb(db);
+      return send(res, 200, order);
+    }
+    if (req.method === "GET" && url.pathname === "/api/inventory") return send(res, 200, db.inventory);
+    if (req.method === "POST" && url.pathname === "/api/inventory/restock") {
+      const input = await body(req);
+      try { restock(db, input); } catch (error) { return send(res, 400, { error: error.message }); }
+      await saveDb(db);
+      return send(res, 200, db.inventory);
+    }
+    if (req.method === "GET" && url.pathname === "/api/ledger") {
+      const accounts = db.orders.map(o => ({ orderId: o.id, masterCode: o.masterCode, status: o.status, ...orderAccount(db, o) }));
+      return send(res, 200, { entries: db.ledger, accounts });
     }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
     send(res, 404, { error: "not_found" });
